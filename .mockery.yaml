@@ -1,0 +1,14 @@
+include-auto-generated: true
+template: testify
+template-data:
+  unroll-variadic: true
+filename: "{{.InterfaceName}}.go"
+packages:
+  go.lumeweb.com/mcpcanvas:
+    config:
+      dir: ./mocks
+      pkgname: mocks
+    interfaces:
+      # No interface mocks are currently needed; add entries here (and run
+      # `mockery` with no arguments — it is pre-installed, never reinstall it)
+      # when a test genuinely requires a generated mock.
