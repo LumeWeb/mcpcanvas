@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "compatibility": "mcpcanvas-asset-manifest/1",
+  "bundles": [
+    {
+      "view": "example",
+      "file": "dist/example.js",
+      "hash": "274c859817764d024d9bbaf2fcb379b3206114033e3b795851f165783d58491f"
+    }
+  ]
+}
