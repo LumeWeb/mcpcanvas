@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { interpret, type Service } from "robot3";
 import { createFlowMachine, type CallTool, type FlowConfig, FlowState, type ToolResult } from "../src/flow";
-import { currentFlowState, renderFlow } from "../src/app-entry";
+import { currentFlowState, renderFlow, runAppEntry } from "../src/app-entry";
 import { until, untilState } from "./helpers";
 
 const baseConfig: FlowConfig = {
@@ -258,6 +258,58 @@ describe("flow machine", () => {
   });
 });
 
+describe("runAppEntry", () => {
+  // Minimal element fixture for the interpreter callback: records attribute
+  // writes so the redirect/DOM-free suite can observe exactly what the UI
+  // stamps onto the approval-link readout.
+  function fakeElement() {
+    const attrs = new Map<string, string>();
+    return {
+      textContent: "",
+      className: "",
+      disabled: false,
+      hidden: false,
+      getAttribute: (name: string) => attrs.get(name) ?? null,
+      setAttribute: (name: string, value: string) => void attrs.set(name, value),
+      removeAttribute: (name: string) => void attrs.delete(name),
+      addEventListener: () => {},
+    } as unknown as HTMLElement & { getAttribute(name: string): string | null };
+  }
+
+  it("clears the approval link readout when the flow resets to idle after completing", async () => {
+    const gate: { op: "start" | "poll"; resolve: (r: ToolResult) => void }[] = [];
+    async function scriptedCall(req: { name: string }): Promise<ToolResult> {
+      return await new Promise<ToolResult>((resolve) =>
+        gate.push({ op: req.name === "start_t" ? "start" : "poll", resolve }),
+      );
+    }
+    const urlEl = fakeElement();
+    const app = runAppEntry({
+      config: baseConfig,
+      callTool: scriptedCall,
+      elements: { startBtn: fakeElement(), urlEl, statusEl: fakeElement() },
+    });
+
+    // Complete a real flow with an approval URL; the readout must be stamped
+    // with a live, clickable link while the flow is pending/ok.
+    app.start();
+    await untilState(app.service, FlowState.Starting);
+    gate.find((g) => g.op === "start")!.resolve(needsHuman("h-1", "https://x.test/approve"));
+    await untilState(app.service, FlowState.Polling);
+    gate.find((g) => g.op === "poll")!.resolve({ structuredContent: { status: "done" } });
+    await untilState(app.service, FlowState.Ok);
+    expect(urlEl.textContent).toBe("https://x.test/approve");
+    expect(urlEl.getAttribute("href")).toBe("https://x.test/approve");
+
+    // The machine's `retry` transition resets to idle, dropping ctx.url to "".
+    // The readout must then be cleared — no stale (possibly expired) approval
+    // page left rendered and clickable.
+    app.service.send("retry");
+    await untilState(app.service, FlowState.Idle);
+    expect(urlEl.textContent).toBe("");
+    expect(urlEl.getAttribute("href")).toBeNull();
+  });
+});
 describe("renderFlow", () => {
   it("already-complete start renders alreadyDoneMsg, not doneMsg", () => {
     const ok = renderFlow(FlowState.Ok, { alreadyDone: true }, baseConfig);

@@ -150,9 +150,13 @@ export function runAppEntry(opts: AppEntryOptions) {
     // (statusState null) leaves the element untouched.
     if (r.statusState) setStatus(statusEl, r.statusState, r.statusMsg ?? "");
 
+    // Stamp or clear the approval-link readout on every transition so a reset / error can't leave a stale (possibly expired) approval page rendered and clickable.
     if (ctx.url) {
       urlEl.textContent = ctx.url;
       urlEl.setAttribute("href", ctx.url);
+    } else {
+      urlEl.textContent = "";
+      urlEl.removeAttribute("href");
     }
   });
 
