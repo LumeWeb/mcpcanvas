@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 // Characterization tests for the host-side MCP Apps document shell and the
@@ -515,5 +517,254 @@ func TestEveryEmbeddedBundleSelfContained(t *testing.T) {
 		if bare := BareModuleSpecifiers(string(data)); len(bare) > 0 {
 			t.Errorf("bundle %q is not inline-module-ready (bare imports the browser cannot resolve: %v)", view, bare)
 		}
+	}
+}
+
+// --- Close-once regression coverage on EmbedSource.Open error paths ---
+//
+// These tests extend the close-tracking approach of
+// TestOpenViewClosesOpenedBundleFile to the error paths assets.go is
+// careful about: a bundle file that is not an io.Seeker and a bundle file
+// whose Seek fails must both be closed exactly once by EmbedSource.Open
+// itself (OpenView never gets a handle to close, because Open returns nil
+// there). The fakes below yield genuinely closable files whose Close calls
+// are counted atomically; nothing is stubbed out with non-closable readers.
+
+// fakeFileStat is a minimal fs.FileInfo for the counting files below. It
+// only needs to make the files valid fs.File values; nothing under test
+// interprets the metadata.
+type fakeFileStat struct {
+	name string
+	size int64
+}
+
+func (s fakeFileStat) Name() string    { return s.name }
+func (s fakeFileStat) Size() int64     { return s.size }
+func (s fakeFileStat) Mode() fs.FileMode { return 0o444 }
+func (s fakeFileStat) ModTime() time.Time { return time.Time{} }
+func (s fakeFileStat) IsDir() bool     { return false }
+func (s fakeFileStat) Sys() any        { return nil }
+
+// countingFile satisfies fs.File with Read, Close, and Stat — and notably
+// NOT io.Seeker — so embedding it pins the not-seekable branch of
+// EmbedSource.Open. It is also enough for fs.ReadFile, which only needs
+// Read (and Close, which it defers in this package paths via EmbedSource).
+type countingFile struct {
+	data   []byte
+	off    int
+	closes *int32
+}
+
+func (f *countingFile) Read(p []byte) (int, error) {
+	if f.off >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.off:])
+	f.off += n
+	return n, nil
+}
+
+func (f *countingFile) Close() error {
+	atomic.AddInt32(f.closes, 1)
+	return nil
+}
+
+func (f *countingFile) Stat() (fs.FileInfo, error) {
+	return fakeFileStat{name: "fake", size: int64(len(f.data))}, nil
+}
+
+// seekingCountingFile is a Read+Seek+Close file whose Seek can be forced to
+// fail, pinning the seek-failure branch of EmbedSource.Open.
+type seekingCountingFile struct {
+	*bytes.Reader
+	closes  *int32
+	seekErr error
+}
+
+func (f *seekingCountingFile) Seek(offset int64, whence int) (int64, error) {
+	if f.seekErr != nil {
+		return 0, f.seekErr
+	}
+	return f.Reader.Seek(offset, whence)
+}
+
+func (f *seekingCountingFile) Close() error {
+	atomic.AddInt32(f.closes, 1)
+	return nil
+}
+
+func (f *seekingCountingFile) Stat() (fs.FileInfo, error) {
+	return fakeFileStat{name: "fake", size: int64(f.Reader.Size())}, nil
+}
+
+// countingFS is a hand-rolled fs.FS serving manifest.json plus one bundle
+// file (v.js), mirroring the layout an EmbedSource consumes. Both files are
+// genuinely closable and share one atomic Close counter (including the
+// manifest handle NewEmbedSource opens at construction).
+type countingFS struct {
+	manifestJSON []byte
+	bundle       []byte
+	// noSeeker serves v.js as a countingFile (no Seek method at all).
+	noSeeker bool
+	// seekErr, when non-nil, is the error v.js's Seek returns. When both
+	// noSeeker and seekErr are unset, v.js is fully seekable.
+	seekErr error
+	closes  *int32
+}
+
+func (f countingFS) Open(name string) (fs.File, error) {
+	switch name {
+	case ManifestFile:
+		if f.manifestJSON == nil {
+			return nil, fs.ErrNotExist
+		}
+		return &countingFile{data: f.manifestJSON, closes: f.closes}, nil
+	case "v.js":
+		if f.noSeeker {
+			return &countingFile{data: f.bundle, closes: f.closes}, nil
+		}
+		return &seekingCountingFile{
+			Reader:  bytes.NewReader(f.bundle),
+			closes:  f.closes,
+			seekErr: f.seekErr,
+		}, nil
+	default:
+		return nil, fs.ErrNotExist
+	}
+}
+
+// fakeFSManifest renders a valid manifest.json body for the counting fake FS:
+// one bundle view "v" backed by file with the given hex sha256.
+func fakeFSManifest(hash, file string) []byte {
+	return []byte(fmt.Sprintf(
+		`{"schemaVersion":%d,"compatibility":"test","bundles":[{"view":"v","file":%q,"hash":%q}]}`,
+		ManifestSchemaVersion, file, hash))
+}
+
+// TestEmbedSourceClosesNonSeekableBundleFile pins the not-seekable error
+// path: when the underlying FS yields a closable file without io.Seeker,
+// EmbedSource.Open must close that handle exactly once itself (the returned
+// reader is nil, so OpenView has nothing to close), must report the failure,
+// and no half-built wrapper may leak — neither the reader nor the bundle
+// bytes nor an unclosed handle.
+func TestEmbedSourceClosesNonSeekableBundleFile(t *testing.T) {
+	var closes int32
+	fsys := countingFS{
+		manifestJSON: fakeFSManifest(strings.Repeat("a", 64), "v.js"),
+		bundle:       []byte("export const x = 42;"),
+		noSeeker:     true,
+		closes:       &closes,
+	}
+	src, err := NewEmbedSource(fsys)
+	if err != nil {
+		t.Fatalf("NewEmbedSource() error: %v", err)
+	}
+	ctx := context.Background()
+
+	// Reset: NewEmbedSource opened (and fs.ReadFile closed) manifest.json
+	// through the counting FS; only the Open calls below are counted.
+	atomic.StoreInt32(&closes, 0)
+
+	if got, err := src.Open(ctx, "v"); err == nil {
+		t.Error("Open(v) succeeded over a non-seekable file, want error")
+	} else if !strings.Contains(err.Error(), "not seekable") {
+		t.Errorf("Open(v) error = %v, want it to mention not seekable", err)
+	} else if got != nil {
+		// No-escape pin: even on error nothing must leak for the caller to
+		// (fail to) close.
+		t.Errorf("Open(v) returned a non-nil reader %#v alongside the error — unclosed wrapper leaked", got)
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after failed Open = %d, want exactly 1", n)
+	}
+
+	// End-to-end through the OpenView wrapper, from a fresh handle.
+	atomic.StoreInt32(&closes, 0)
+	data, err := OpenView(ctx, src, "v")
+	if err == nil {
+		t.Error("OpenView(v) succeeded over a non-seekable file, want error")
+	} else if !strings.Contains(err.Error(), "not seekable") {
+		t.Errorf("OpenView(v) error = %v, want it to mention not seekable", err)
+	} else if data != nil {
+		t.Errorf("OpenView returned %d bytes alongside the error — content must not escape a failed open", len(data))
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after failed OpenView = %d, want exactly 1", n)
+	}
+}
+
+// TestEmbedSourceClosesWhenSeekFails pins the seek-failure error path: when
+// the bundle file implements io.Seeker but its Seek fails, EmbedSource.Open
+// must close the handle exactly once and surface the seek error (wrapped, so
+// callers can errors.Is it). The failing handle must not escape.
+func TestEmbedSourceClosesWhenSeekFails(t *testing.T) {
+	seekBroken := errors.New("seek: failpoint")
+	var closes int32
+	fsys := countingFS{
+		manifestJSON: fakeFSManifest(strings.Repeat("a", 64), "v.js"),
+		bundle:       []byte("export const x = 42;"),
+		seekErr:      seekBroken,
+		closes:       &closes,
+	}
+	src, err := NewEmbedSource(fsys)
+	if err != nil {
+		t.Fatalf("NewEmbedSource() error: %v", err)
+	}
+	ctx := context.Background()
+
+	atomic.StoreInt32(&closes, 0) // ignore the construction-time manifest open
+
+	if got, err := src.Open(ctx, "v"); !errors.Is(err, seekBroken) {
+		t.Errorf("Open(v) error = %v, want it to wrap the seek failure %v", err, seekBroken)
+	} else if got != nil {
+		t.Errorf("Open(v) returned a non-nil reader %#v alongside the error — unclosed wrapper leaked", got)
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after failed Open = %d, want exactly 1", n)
+	}
+
+	atomic.StoreInt32(&closes, 0)
+	data, err := OpenView(ctx, src, "v")
+	if !errors.Is(err, seekBroken) {
+		t.Errorf("OpenView(v) error = %v, want it to wrap the seek failure %v", err, seekBroken)
+	} else if data != nil {
+		t.Errorf("OpenView returned %d bytes alongside the error", len(data))
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after failed OpenView = %d, want exactly 1", n)
+	}
+}
+
+// TestOpenViewClosesVerifiedBundleFileExactlyOnce extends the success-path
+// close coverage to the hand-built-asset-set shape: OpenView over a fake FS
+// with a hash-verifying manifest must return the verified bundle bytes while
+// closing the opened handle exactly once — a future regression where the
+// embed source (or the wrapper) also closed the file internally would push
+// the count to 2 and fail here.
+func TestOpenViewClosesVerifiedBundleFileExactlyOnce(t *testing.T) {
+	const content = "console.log('close-once');"
+	var closes int32
+	fsys := countingFS{
+		manifestJSON: fakeFSManifest(sha256Hex(content), "v.js"),
+		bundle:       []byte(content),
+		closes:       &closes,
+	}
+	src, err := NewEmbedSource(fsys)
+	if err != nil {
+		t.Fatalf("NewEmbedSource() error: %v", err)
+	}
+	ctx := context.Background()
+
+	atomic.StoreInt32(&closes, 0) // ignore the construction-time manifest open
+
+	got, err := OpenView(ctx, src, "v")
+	if err != nil {
+		t.Fatalf("OpenView(v) error: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("OpenView(v) = %q, want the verified bundle content %q", got, content)
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after successful OpenView = %d, want exactly 1 (double-close regression?)", n)
 	}
 }
