@@ -100,8 +100,11 @@ func (s *EmbedSource) Manifest(context.Context) (Manifest, error) {
 }
 
 // Open returns a ReadSeeker over the bundle registered for view, rewound to
-// its start. Unknown views wrap ErrMissingBundle; a manifest entry whose file
-// is missing from the underlying FS is reported as such.
+// its start. When the underlying FS provides a closable file (e.g. a
+// files-based fs.FS such as os.DirFS), the returned value is also an
+// io.Closer and callers are expected to close it (OpenView does). Unknown
+// views wrap ErrMissingBundle; a manifest entry whose file is missing from
+// the underlying FS is reported as such.
 func (s *EmbedSource) Open(_ context.Context, view string) (io.ReadSeeker, error) {
 	bundle, err := s.manifest.Lookup(view)
 	if err != nil {
@@ -123,7 +126,8 @@ func (s *EmbedSource) Open(_ context.Context, view string) (io.ReadSeeker, error
 	return struct {
 		io.Reader
 		io.Seeker
-	}{f, seeker}, nil
+		io.Closer
+	}{f, seeker, f}, nil
 }
 
 // semverRaw matches a bare semver core (MAJOR.MINOR.PATCH with optional
@@ -183,6 +187,9 @@ func OpenView(ctx context.Context, src AssetSource, view string) ([]byte, error)
 	r, err := src.Open(ctx, view)
 	if err != nil {
 		return nil, fmt.Errorf("mcpcanvas: open bundle for view %q: %w", view, err)
+	}
+	if c, ok := r.(io.Closer); ok {
+		defer c.Close()
 	}
 	got, err := digestHex(r)
 	if err != nil {

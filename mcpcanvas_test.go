@@ -1,13 +1,16 @@
 package mcpcanvas
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 )
@@ -289,6 +292,107 @@ func TestOpenViewUnknownView(t *testing.T) {
 	if _, err := ModuleJS(ctx, fake, "no-such-view", "v1.0.0"); !errors.Is(err, ErrMissingBundle) {
 		t.Errorf("ModuleJS(unknown) = %v, want ErrMissingBundle", err)
 	}
+}
+
+// closeTrackingFS wraps the embedded asset root so every Open returns a
+// genuinely seekable file that counts its Close calls atomically, letting the
+// close-contract test observe OpenView's cleanup without stubbing out the
+// real EmbedSource path.
+type closeTrackingFS struct {
+	inner  fs.FS
+	closes *int32
+}
+
+func (f closeTrackingFS) Open(name string) (fs.File, error) {
+	file, err := f.inner.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	data, rerr := io.ReadAll(file)
+	if rerr != nil {
+		_ = file.Close()
+		return nil, rerr
+	}
+	return &closeTrackingFile{File: file, Reader: bytes.NewReader(data), closes: f.closes}, nil
+}
+
+type closeTrackingFile struct {
+	fs.File
+	*bytes.Reader
+	closes *int32
+}
+
+func (f *closeTrackingFile) Read(p []byte) (int, error) { return f.Reader.Read(p) }
+
+func (f *closeTrackingFile) Close() error {
+	atomic.AddInt32(f.closes, 1)
+	return f.File.Close()
+}
+
+// TestOpenViewClosesOpenedBundleFile pins the fd-leak fix: when the asset
+// source's underlying FS yields closable files, OpenView must close the
+// bundle handle exactly once on the success path, must never open (hence
+// close) a handle for an unknown view, and must still return the verified
+// bundle content after its deferred close fires. It drives the real
+// EmbedSource over the embedded asset set and observes the observable close
+// side effect rather than stubbing the source out.
+func TestOpenViewClosesOpenedBundleFile(t *testing.T) {
+	root, err := fs.Sub(assetsFS, "assets")
+	if err != nil {
+		t.Fatalf("fs.Sub(assets) error: %v", err)
+	}
+	var closes int32
+	src, err := NewEmbedSource(closeTrackingFS{inner: root, closes: &closes})
+	if err != nil {
+		t.Fatalf("NewEmbedSource() error: %v", err)
+	}
+	// Building the source read+closed manifest.json through the tracking FS.
+	atomic.StoreInt32(&closes, 0)
+	ctx := context.Background()
+
+	got, err := OpenView(ctx, src, "example")
+	if err != nil {
+		t.Fatalf("OpenView(example) error: %v", err)
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after successful OpenView = %d, want 1", n)
+	}
+	if strings.TrimSpace(string(got)) == "" {
+		t.Fatal("OpenView returned empty content")
+	}
+
+	// The success path must be unchanged: the same bytes DefaultSource serves.
+	want, err := OpenView(ctx, mustDefaultSource(t), "example")
+	if err != nil {
+		t.Fatalf("DefaultSource OpenView(example) error: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("OpenView over tracking FS returned different bytes than DefaultSource")
+	}
+
+	// An unknown view never reaches src.Open, so no handle is opened or closed.
+	if _, err := OpenView(ctx, src, "no-such-view"); !errors.Is(err, ErrMissingBundle) {
+		t.Errorf("OpenView(unknown) = %v, want ErrMissingBundle", err)
+	}
+	if n := atomic.LoadInt32(&closes); n != 1 {
+		t.Errorf("close count after unknown-view OpenView = %d, want still 1", n)
+	}
+
+	// Read-before-close correctness: the tracking FS re-opens and re-parses
+	// the manifest below, so verify the manifest is still serviceable after
+	// the closed handles — a fresh OpenView must succeed.
+	if _, err := OpenView(ctx, src, "example"); err != nil {
+		t.Fatalf("OpenView(example) after prior closes error: %v", err)
+	}
+}
+
+func mustDefaultSource(t *testing.T) *EmbedSource {
+	t.Helper()
+	src, err := DefaultSource()
+	if err != nil {
+		t.Fatalf("DefaultSource() error: %v", err)
+	}
+	return src
 }
 
 // TestOpenViewHashMismatch pins that tampered bundle content is refused with
